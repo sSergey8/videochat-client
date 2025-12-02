@@ -1,66 +1,86 @@
-<!DOCTYPE html>
+<!DOCTYPE html> // Версия 1.2.0
 <html>
 <head>
 <meta charset="UTF-8">
 <title>P2P Video Chat</title>
 <style>
-    video { width: 45%; }
+    video { width: 45%; margin: 5px; background: black; }
 </style>
 </head>
 <body>
 
-<h2>My P2P Video Chat</h2>
-<video id="localVideo" autoplay muted></video>
-<video id="remoteVideo" autoplay></video>
+<h2>P2P Video Chat</h2>
+<video id="localVideo" autoplay muted playsinline></video>
+<video id="remoteVideo" autoplay playsinline></video>
 
 <script>
-const signalingUrl = "wss://webrtc-signaling-server-9su4.onrender.com"; // подставь свой URL
+// 🔗 ВСТАВЬ СЮДА СВОЙ WSS URL
+const signalingUrl = "wss://webrtc-signaling-server.onrender.com";
+
+// подключение к signaling-серверу
 const socket = new WebSocket(signalingUrl);
 
 let pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 });
 
-navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-    .then(stream => {
-        document.getElementById("localVideo").srcObject = stream;
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
-    });
+// Добавление ICE кандидатов
+pc.onicecandidate = event => {
+    if (event.candidate) {
+        socket.send(JSON.stringify({ type: "candidate", candidate: event.candidate }));
+    }
+};
 
+// получаем remote stream
 pc.ontrack = event => {
     document.getElementById("remoteVideo").srcObject = event.streams[0];
 };
 
-pc.onicecandidate = event => {
-    if (event.candidate) {
-        socket.send(JSON.stringify({ candidate: event.candidate }));
-    }
+// ждем сокет соединения
+socket.onopen = async () => {
+    console.log("WebSocket connected");
 };
 
-socket.onmessage = async (msg) => {
+// обработка сообщений signaling
+socket.onmessage = async msg => {
     const data = JSON.parse(msg.data);
 
-    if (data.offer) {
+    if (data.type === "offer") {
         await pc.setRemoteDescription(data.offer);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.send(JSON.stringify({ answer }));
+        socket.send(JSON.stringify({ type: "answer", answer }));
     }
 
-    if (data.answer) {
-        pc.setRemoteDescription(data.answer);
+    if (data.type === "answer") {
+        await pc.setRemoteDescription(data.answer);
     }
 
-    if (data.candidate) {
-        pc.addIceCandidate(data.candidate);
+    if (data.type === "candidate") {
+        try {
+            await pc.addIceCandidate(data.candidate);
+        } catch (e) {
+            console.error("Error adding ICE", e);
+        }
     }
 };
 
-socket.onopen = async () => {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    socket.send(JSON.stringify({ offer }));
-};
+// 🎥 Запрашиваем камеру и МИКРОФОН
+navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+    .then(async stream => {
+        const localVideo = document.getElementById("localVideo");
+        localVideo.srcObject = stream;
+
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+        // теперь создаём offer ТОЛЬКО после добавления треков
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.send(JSON.stringify({ type: "offer", offer }));
+
+    }).catch(err => {
+        console.error("Media error:", err);
+    });
 </script>
 </body>
 </html>

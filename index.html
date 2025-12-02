@@ -1,4 +1,4 @@
-// Версия 1.2.3
+// Версия 1.2.4
 <!DOCTYPE html>
 <html>
 <head>
@@ -19,98 +19,101 @@
 <video id="remoteVideo" autoplay playsinline></video>
 
 <script>
-// 🔗 Твой signaling server
+// ---- Настройки ----
 const signalingUrl = "wss://webrtc-signaling-server-9su4.onrender.com";
+const room = "default-room";
 
-// 🔥 Комната (одинаковая у двух пользователей)
-const ROOM = "room123";
-
+// ---- WebSocket ----
 const socket = new WebSocket(signalingUrl);
+let socketReady = false;
+let messageQueue = [];
 
+// отправка сообщений (ждём подключения)
+function wsSend(data) {
+    if (!socketReady) {
+        messageQueue.push(data);
+        return;
+    }
+    socket.send(JSON.stringify(data));
+}
+
+socket.onopen = () => {
+    console.log("WS connected");
+    socketReady = true;
+
+    wsSend({ type: "join", room });
+
+    // отправляем накопленные сообщения
+    messageQueue.forEach(msg => socket.send(JSON.stringify(msg)));
+    messageQueue = [];
+};
+
+socket.onerror = (e) => console.error("WS error", e);
+
+// ---- WebRTC ----
 let pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 });
 
-// Отправка ICE
 pc.onicecandidate = event => {
     if (event.candidate) {
-        socket.send(JSON.stringify({
-            type: "candidate",
-            room: ROOM,
-            candidate: event.candidate
-        }));
+        wsSend({ type: "candidate", candidate: event.candidate });
     }
 };
 
-// Получение remote потока
 pc.ontrack = event => {
+    console.log("Remote stream added");
     document.getElementById("remoteVideo").srcObject = event.streams[0];
 };
 
-// 🔥 Обработка входящих сигналов (исправлено Blob → JSON)
+// обработка сигнала
 socket.onmessage = async msg => {
-
-    let text;
-    if (msg.data instanceof Blob) {
-        text = await msg.data.text();
-    } else {
-        text = msg.data;
-    }
-
-    let data;
-    try {
-        data = JSON.parse(text);
-    } catch (e) {
-        console.warn("Пропускаю не-JSON сообщение:", text);
-        return;
-    }
+    const data = JSON.parse(msg.data);
 
     if (data.type === "offer") {
+        console.log("Got offer");
         await pc.setRemoteDescription(data.offer);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-
-        socket.send(JSON.stringify({
-            type: "answer",
-            room: ROOM,
-            answer
-        }));
+        wsSend({ type: "answer", answer });
     }
 
     if (data.type === "answer") {
+        console.log("Got answer");
         await pc.setRemoteDescription(data.answer);
     }
 
     if (data.type === "candidate") {
-        await pc.addIceCandidate(data.candidate);
+        try {
+            await pc.addIceCandidate(data.candidate);
+        } catch (e) {
+            console.error("Error adding ICE", e);
+        }
     }
 };
 
-// 🔥 После подключения к WebSocket → входим в комнату
-socket.onopen = () => {
-    socket.send(JSON.stringify({
-        type: "join",
-        room: ROOM
-    }));
-};
-
-// 🎥 Запрашиваем видео + аудио
+// ---- Камера + микрофон ----
 navigator.mediaDevices.getUserMedia({ video: true, audio: true })
     .then(async stream => {
         document.getElementById("localVideo").srcObject = stream;
 
         stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-        // Создаем offer после добавления треков
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        // создаём offer только после подключения WebSocket
+        const makeOffer = async () => {
+            if (!socketReady) {
+                setTimeout(makeOffer, 200);
+                return;
+            }
+            console.log("Sending offer");
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            wsSend({ type: "offer", offer });
+        };
 
-        socket.send(JSON.stringify({
-            type: "offer",
-            room: ROOM,
-            offer
-        }));
-    });
+        makeOffer();
+    })
+    .catch(err => console.error("Media error:", err));
 </script>
 </body>
 </html>

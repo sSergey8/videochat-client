@@ -1,4 +1,5 @@
-<!DOCTYPE html> // Версия 1.2.1
+// Версия 1.2.2
+<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -14,34 +15,38 @@
 <video id="remoteVideo" autoplay playsinline></video>
 
 <script>
-// 🔗 ВСТАВЬ СЮДА СВОЙ WSS URL
 const signalingUrl = "wss://webrtc-signaling-server-9su4.onrender.com";
+const ROOM = "room123"; // 🔥 одинаково у всех
 
-// подключение к signaling-серверу
 const socket = new WebSocket(signalingUrl);
 
 let pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 });
 
-// Добавление ICE кандидатов
 pc.onicecandidate = event => {
     if (event.candidate) {
-        socket.send(JSON.stringify({ type: "candidate", candidate: event.candidate }));
+        socket.send(JSON.stringify({
+            type: "candidate",
+            candidate: event.candidate
+        }));
     }
 };
 
-// получаем remote stream
 pc.ontrack = event => {
     document.getElementById("remoteVideo").srcObject = event.streams[0];
 };
 
-// ждем сокет соединения
-socket.onopen = async () => {
-    console.log("WebSocket connected");
+socket.onopen = () => {
+    console.log("WS connected");
+
+    // 🔥 ОБЯЗАТЕЛЬНО – присоединяемся к комнате
+    socket.send(JSON.stringify({
+        type: "join",
+        room: ROOM
+    }));
 };
 
-// обработка сообщений signaling
 socket.onmessage = async msg => {
     const data = JSON.parse(msg.data);
 
@@ -57,29 +62,20 @@ socket.onmessage = async msg => {
     }
 
     if (data.type === "candidate") {
-        try {
-            await pc.addIceCandidate(data.candidate);
-        } catch (e) {
-            console.error("Error adding ICE", e);
-        }
+        await pc.addIceCandidate(data.candidate);
     }
 };
 
-// 🎥 Запрашиваем камеру и МИКРОФОН
 navigator.mediaDevices.getUserMedia({ video: true, audio: true })
     .then(async stream => {
-        const localVideo = document.getElementById("localVideo");
-        localVideo.srcObject = stream;
+        document.getElementById("localVideo").srcObject = stream;
 
         stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-        // теперь создаём offer ТОЛЬКО после добавления треков
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        socket.send(JSON.stringify({ type: "offer", offer }));
 
-    }).catch(err => {
-        console.error("Media error:", err);
+        socket.send(JSON.stringify({ type: "offer", offer }));
     });
 </script>
 </body>

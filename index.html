@@ -1,11 +1,15 @@
-// Версия 1.2.2
+// Версия 1.2.3
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <title>P2P Video Chat</title>
 <style>
-    video { width: 45%; margin: 5px; background: black; }
+    video {
+        width: 45%;
+        margin: 5px;
+        background: black;
+    }
 </style>
 </head>
 <body>
@@ -15,8 +19,11 @@
 <video id="remoteVideo" autoplay playsinline></video>
 
 <script>
+// 🔗 Твой signaling server
 const signalingUrl = "wss://webrtc-signaling-server-9su4.onrender.com";
-const ROOM = "room123"; // 🔥 одинаково у всех
+
+// 🔥 Комната (одинаковая у двух пользователей)
+const ROOM = "room123";
 
 const socket = new WebSocket(signalingUrl);
 
@@ -24,37 +31,50 @@ let pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 });
 
+// Отправка ICE
 pc.onicecandidate = event => {
     if (event.candidate) {
         socket.send(JSON.stringify({
             type: "candidate",
+            room: ROOM,
             candidate: event.candidate
         }));
     }
 };
 
+// Получение remote потока
 pc.ontrack = event => {
     document.getElementById("remoteVideo").srcObject = event.streams[0];
 };
 
-socket.onopen = () => {
-    console.log("WS connected");
-
-    // 🔥 ОБЯЗАТЕЛЬНО – присоединяемся к комнате
-    socket.send(JSON.stringify({
-        type: "join",
-        room: ROOM
-    }));
-};
-
+// 🔥 Обработка входящих сигналов (исправлено Blob → JSON)
 socket.onmessage = async msg => {
-    const data = JSON.parse(msg.data);
+
+    let text;
+    if (msg.data instanceof Blob) {
+        text = await msg.data.text();
+    } else {
+        text = msg.data;
+    }
+
+    let data;
+    try {
+        data = JSON.parse(text);
+    } catch (e) {
+        console.warn("Пропускаю не-JSON сообщение:", text);
+        return;
+    }
 
     if (data.type === "offer") {
         await pc.setRemoteDescription(data.offer);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.send(JSON.stringify({ type: "answer", answer }));
+
+        socket.send(JSON.stringify({
+            type: "answer",
+            room: ROOM,
+            answer
+        }));
     }
 
     if (data.type === "answer") {
@@ -66,16 +86,30 @@ socket.onmessage = async msg => {
     }
 };
 
+// 🔥 После подключения к WebSocket → входим в комнату
+socket.onopen = () => {
+    socket.send(JSON.stringify({
+        type: "join",
+        room: ROOM
+    }));
+};
+
+// 🎥 Запрашиваем видео + аудио
 navigator.mediaDevices.getUserMedia({ video: true, audio: true })
     .then(async stream => {
         document.getElementById("localVideo").srcObject = stream;
 
         stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
+        // Создаем offer после добавления треков
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        socket.send(JSON.stringify({ type: "offer", offer }));
+        socket.send(JSON.stringify({
+            type: "offer",
+            room: ROOM,
+            offer
+        }));
     });
 </script>
 </body>

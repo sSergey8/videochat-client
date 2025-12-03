@@ -1,4 +1,4 @@
-// Версия 1.3.0
+// Версия 1.3.1
 <!DOCTYPE html>
 <html>
 <head>
@@ -53,14 +53,20 @@ socket.onerror = (e) => console.error("WS error", e);
 // ---- WebRTC ----
 let pc = new RTCPeerConnection({
     iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    {
-        urls: "turn:YOUR-RAILWAY-DOMAIN:3478",
-        username: "user",
-        credential: "pass"
-    }
-]
+        { urls: "stun:stun.l.google.com:19302" },
+        {
+            urls: "turn:webrtc-turnserver-production.up.railway.app:3478?transport=udp",
+            username: "user",
+            credential: "pass"
+        },
+        {
+            urls: "turn:webrtc-turnserver-production.up.railway.app:3478?transport=tcp",
+            username: "user",
+            credential: "pass"
+        }
+    ]
 });
+
 
 pc.onicecandidate = event => {
     if (event.candidate) {

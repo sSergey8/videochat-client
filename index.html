@@ -1,4 +1,4 @@
-// Версия 1.3.4
+// Версия 1.3.5
 <!DOCTYPE html>
 <html>
 <head>
@@ -72,32 +72,44 @@ socket.onopen = () => {
 socket.onmessage = async msg => {
     const data = JSON.parse(msg.data);
 
+    // === Новый блок: реакция на joined ===
     if (data.type === "joined") {
-        // server сообщает сколько клиентов в комнате
-        if (data.count === 1) {
-            isOfferer = true;    // первый → делает offer
-        } else {
-            isOfferer = false;   // второй → ждет offer
+        console.log("Joined room. Users count:", data.count);
+
+        // Только первый пользователь создаёт offer
+        if (data.count === 2) {
+            console.log("I'm second → wait for offer");
+        } else if (data.count === 1) {
+            console.log("I'm first → will create offer when stream is ready");
         }
+        return;
     }
 
     if (data.type === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+        console.log("Got offer");
+        await pc.setRemoteDescription(data.offer);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.send(JSON.stringify({ type: "answer", answer }));
+        wsSend({ type: "answer", answer });
+        return;
     }
 
     if (data.type === "answer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        console.log("Got answer");
+        await pc.setRemoteDescription(data.answer);
+        return;
     }
 
     if (data.type === "candidate") {
         try {
             await pc.addIceCandidate(data.candidate);
-        } catch {}
+        } catch (e) {
+            console.error("Error adding ICE", e);
+        }
+        return;
     }
 };
+
 
 // --- Media ---
 navigator.mediaDevices.getUserMedia({ video: true, audio: true })

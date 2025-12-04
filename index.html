@@ -1,4 +1,4 @@
-// Версия 1.4.1
+// Версия 1.4.2
 <!DOCTYPE html>
 <html>
 <head>
@@ -31,33 +31,42 @@ let messageQueue = [];
 // кто инициатор переговоров (тот, кто создаёт offer)
 let isInitiator = false;
 
-// отправка сообщений (ждём подключения)
+// отправка сообщений (через очередь, если socket не готов)
 function wsSend(data) {
     if (!socketReady) {
         messageQueue.push(data);
+        console.log("Queued WS message:", data.type || data);
         return;
     }
-    socket.send(JSON.stringify(data));
+    try {
+        socket.send(JSON.stringify(data));
+    } catch (e) {
+        console.error("wsSend failed:", e);
+    }
 }
 
 socket.onopen = () => {
     console.log("WS connected");
     socketReady = true;
 
+    // сразу отправляем join (и другие накопленные сообщения)
     wsSend({ type: "join", room });
 
-    // отправляем накопленные сообщения (через wsSend чтобы не дублировать логику)
-    messageQueue.forEach(msg => {
-        socket.send(JSON.stringify(msg));
-    });
-    messageQueue = [];
+    // flush queue (in case some messages queued before socketReady)
+    while (messageQueue.length) {
+        const msg = messageQueue.shift();
+        try {
+            socket.send(JSON.stringify(msg));
+        } catch (e) {
+            console.error("Error sending queued msg:", e);
+        }
+    }
 };
 
 socket.onerror = (e) => console.error("WS error", e);
 socket.onclose = () => console.log("WS closed");
 
 // ---- WebRTC ----
-// TURN/STUN — оставил ваши сервера (при желании можно убрать/заменить)
 const pc = new RTCPeerConnection({
     iceServers: [
         { urls: "stun:global.stun.twilio.com:3478" },
@@ -88,11 +97,9 @@ pc.onicecandidate = event => {
 
 pc.ontrack = event => {
     console.log("Remote stream added");
-    // иногда event.streams может быть пуст, тогда можно собрать из event.track
     if (event.streams && event.streams[0]) {
         document.getElementById("remoteVideo").srcObject = event.streams[0];
     } else {
-        // fallback: создать новый MediaStream и добавить track
         const inboundStream = new MediaStream();
         inboundStream.addTrack(event.track);
         document.getElementById("remoteVideo").srcObject = inboundStream;
@@ -123,12 +130,24 @@ socket.onmessage = async msg => {
 
     if (data.type === "joined") {
         const count = data.count || 0;
-        console.log("Joined room, count =", count);
+        console.log("Joined (you), count =", count);
 
+        // ТОЛЬКО тот, кто получает joined с count===2 — инициатор
         if (count === 2) {
             isInitiator = true;
+            // убедимся, что локальные треки уже добавлены
+            if (!localStream) {
+                console.warn("No localStream yet, cannot create offer now");
+                return;
+            }
             await makeOffer();
         }
+        return;
+    }
+
+    if (data.type === "peer-joined") {
+        // вспомогательное уведомление для UI — другой вошёл
+        console.log("Peer joined notice, room count =", data.count);
         return;
     }
 
@@ -141,6 +160,11 @@ socket.onmessage = async msg => {
             return;
         }
 
+        // Создаём answer (убедившись, что локальные треки добавлены)
+        if (!localStream) {
+            console.warn("No localStream yet when received offer");
+            return;
+        }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         wsSend({ type: "answer", answer });
@@ -173,16 +197,11 @@ let localStream = null;
 
 async function startLocalMedia() {
     try {
-        // можно уточнить facingMode: 'user' для фронталки, 'environment' для задней камеры
         localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         document.getElementById("localVideo").srcObject = localStream;
 
-        // добавляем треки в RTCPeerConnection
         localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
         console.log("Local tracks added to RTCPeerConnection");
-
-        // если мы уже получили 'joined' с count=2 раньше, makeOffer будет вызван;
-        // иначе makeOffer вызовется в обработчике 'joined' когда count === 2.
     } catch (err) {
         console.error("Media error:", err);
         alert("Ошибка доступа к камере/микрофону: " + err.message);
@@ -191,9 +210,12 @@ async function startLocalMedia() {
 
 // Создаём offer (если инициатор)
 const makeOffer = async () => {
-    // защита от повторного вызова
     if (!socketReady) {
         console.log("Socket not ready for offer, retry later");
+        return;
+    }
+    if (!localStream) {
+        console.log("No localStream for offer");
         return;
     }
     console.log("makeOffer() called, isInitiator =", isInitiator);

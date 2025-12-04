@@ -1,4 +1,4 @@
-// Версия 1.3.3
+// Версия 1.3.4
 <!DOCTYPE html>
 <html>
 <head>
@@ -19,39 +19,18 @@
 <video id="remoteVideo" autoplay playsinline></video>
 
 <script>
-// ---- Настройки ----
+
+// === SETTINGS ===
 const signalingUrl = "wss://webrtc-signaling-server-9su4.onrender.com";
 const room = "default-room";
 
-// ---- WebSocket ----
+// --- WebSocket ---
 const socket = new WebSocket(signalingUrl);
+
 let socketReady = false;
-let messageQueue = [];
+let isOfferer = false;
 
-// отправка сообщений (ждём подключения)
-function wsSend(data) {
-    if (!socketReady) {
-        messageQueue.push(data);
-        return;
-    }
-    socket.send(JSON.stringify(data));
-}
-
-socket.onopen = () => {
-    console.log("WS connected");
-    socketReady = true;
-
-    wsSend({ type: "join", room });
-
-    // отправляем накопленные сообщения
-    messageQueue.forEach(msg => socket.send(JSON.stringify(msg)));
-    messageQueue = [];
-};
-
-socket.onerror = (e) => console.error("WS error", e);
-
-// ---- WebRTC ----
-// *** Главное изменение: рабочий бесплатный TURN OpenRelay ***
+// --- WebRTC ---
 let pc = new RTCPeerConnection({
     iceServers: [
         { urls: "stun:global.stun.twilio.com:3478" },
@@ -73,66 +52,74 @@ let pc = new RTCPeerConnection({
     ]
 });
 
-
+// --- Peer events ---
 pc.onicecandidate = event => {
     if (event.candidate) {
-        wsSend({ type: "candidate", candidate: event.candidate });
+        socket.send(JSON.stringify({ type: "candidate", candidate: event.candidate }));
     }
 };
 
 pc.ontrack = event => {
-    console.log("Remote stream added");
     document.getElementById("remoteVideo").srcObject = event.streams[0];
 };
 
-// обработка сигнала
+// --- WebSocket events ---
+socket.onopen = () => {
+    socketReady = true;
+    socket.send(JSON.stringify({ type: "join", room }));
+};
+
 socket.onmessage = async msg => {
     const data = JSON.parse(msg.data);
 
+    if (data.type === "joined") {
+        // server сообщает сколько клиентов в комнате
+        if (data.count === 1) {
+            isOfferer = true;    // первый → делает offer
+        } else {
+            isOfferer = false;   // второй → ждет offer
+        }
+    }
+
     if (data.type === "offer") {
-        console.log("Got offer");
-        await pc.setRemoteDescription(data.offer);
+        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        wsSend({ type: "answer", answer });
+        socket.send(JSON.stringify({ type: "answer", answer }));
     }
 
     if (data.type === "answer") {
-        console.log("Got answer");
-        await pc.setRemoteDescription(data.answer);
+        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
     }
 
     if (data.type === "candidate") {
         try {
             await pc.addIceCandidate(data.candidate);
-        } catch (e) {
-            console.error("Error adding ICE", e);
-        }
+        } catch {}
     }
 };
 
-// ---- Камера + микрофон ----
+// --- Media ---
 navigator.mediaDevices.getUserMedia({ video: true, audio: true })
     .then(async stream => {
         document.getElementById("localVideo").srcObject = stream;
+        stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
-
-        // создаём offer только после подключения WebSocket
-        const makeOffer = async () => {
-            if (!socketReady) {
-                setTimeout(makeOffer, 200);
-                return;
-            }
-            console.log("Sending offer");
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            wsSend({ type: "offer", offer });
+        // создаем offer только если мы offerer
+        const wait = () => {
+            if (!socketReady) return setTimeout(wait, 100);
+            if (isOfferer) createOffer();
         };
 
-        makeOffer();
-    })
-    .catch(err => console.error("Media error:", err));
+        wait();
+    });
+
+async function createOffer() {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.send(JSON.stringify({ type: "offer", offer }));
+}
+
 </script>
 </body>
 </html>

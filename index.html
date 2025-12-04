@@ -1,4 +1,4 @@
-// Версия 1.4.2
+// Версия 1.4.3
 <!DOCTYPE html>
 <html>
 <head>
@@ -28,46 +28,31 @@ const socket = new WebSocket(signalingUrl);
 let socketReady = false;
 let messageQueue = [];
 
-// кто инициатор переговоров (тот, кто создаёт offer)
-let isInitiator = false;
-
-// отправка сообщений (через очередь, если socket не готов)
+// отправка сообщений (ждём подключения)
 function wsSend(data) {
     if (!socketReady) {
         messageQueue.push(data);
-        console.log("Queued WS message:", data.type || data);
         return;
     }
-    try {
-        socket.send(JSON.stringify(data));
-    } catch (e) {
-        console.error("wsSend failed:", e);
-    }
+    socket.send(JSON.stringify(data));
 }
 
 socket.onopen = () => {
     console.log("WS connected");
     socketReady = true;
 
-    // сразу отправляем join (и другие накопленные сообщения)
     wsSend({ type: "join", room });
 
-    // flush queue (in case some messages queued before socketReady)
-    while (messageQueue.length) {
-        const msg = messageQueue.shift();
-        try {
-            socket.send(JSON.stringify(msg));
-        } catch (e) {
-            console.error("Error sending queued msg:", e);
-        }
-    }
+    // отправляем накопленные сообщения
+    messageQueue.forEach(msg => socket.send(JSON.stringify(msg)));
+    messageQueue = [];
 };
 
 socket.onerror = (e) => console.error("WS error", e);
-socket.onclose = () => console.log("WS closed");
 
 // ---- WebRTC ----
-const pc = new RTCPeerConnection({
+// *** Главное изменение: рабочий бесплатный TURN OpenRelay ***
+let pc = new RTCPeerConnection({
     iceServers: [
         { urls: "stun:global.stun.twilio.com:3478" },
         {
@@ -88,151 +73,66 @@ const pc = new RTCPeerConnection({
     ]
 });
 
+
 pc.onicecandidate = event => {
     if (event.candidate) {
-        console.log("Sending ICE candidate");
         wsSend({ type: "candidate", candidate: event.candidate });
     }
 };
 
 pc.ontrack = event => {
     console.log("Remote stream added");
-    if (event.streams && event.streams[0]) {
-        document.getElementById("remoteVideo").srcObject = event.streams[0];
-    } else {
-        const inboundStream = new MediaStream();
-        inboundStream.addTrack(event.track);
-        document.getElementById("remoteVideo").srcObject = inboundStream;
-    }
-};
-
-pc.onconnectionstatechange = () => {
-    console.log("Connection state:", pc.connectionState);
-};
-
-pc.oniceconnectionstatechange = () => {
-    console.log("ICE connection state:", pc.iceConnectionState);
+    document.getElementById("remoteVideo").srcObject = event.streams[0];
 };
 
 // обработка сигнала
 socket.onmessage = async msg => {
-    console.log("<<< RAW WS:", msg.data);
-
-    let data;
-    try {
-        data = JSON.parse(msg.data);
-    } catch (e) {
-        console.error("JSON parse failed:", e);
-        return;
-    }
-
-    console.log("WS message:", data);
-
-    if (data.type === "joined") {
-        const count = data.count || 0;
-        console.log("Joined (you), count =", count);
-
-        // ТОЛЬКО тот, кто получает joined с count===2 — инициатор
-        if (count === 2) {
-            isInitiator = true;
-            // убедимся, что локальные треки уже добавлены
-            if (!localStream) {
-                console.warn("No localStream yet, cannot create offer now");
-                return;
-            }
-            await makeOffer();
-        }
-        return;
-    }
-
-    if (data.type === "peer-joined") {
-        // вспомогательное уведомление для UI — другой вошёл
-        console.log("Peer joined notice, room count =", data.count);
-        return;
-    }
+    const data = JSON.parse(msg.data);
 
     if (data.type === "offer") {
         console.log("Got offer");
-        try {
-            await pc.setRemoteDescription(data.offer);
-        } catch (e) {
-            console.error("setRemoteDescription(offer) failed:", e);
-            return;
-        }
-
-        // Создаём answer (убедившись, что локальные треки добавлены)
-        if (!localStream) {
-            console.warn("No localStream yet when received offer");
-            return;
-        }
+        await pc.setRemoteDescription(data.offer);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         wsSend({ type: "answer", answer });
-        return;
     }
 
     if (data.type === "answer") {
         console.log("Got answer");
-        try {
-            await pc.setRemoteDescription(data.answer);
-        } catch (e) {
-            console.error("setRemoteDescription(answer) failed:", e);
-        }
-        return;
+        await pc.setRemoteDescription(data.answer);
     }
 
     if (data.type === "candidate") {
         try {
             await pc.addIceCandidate(data.candidate);
-            console.log("Added remote ICE candidate");
         } catch (e) {
             console.error("Error adding ICE", e);
         }
-        return;
     }
 };
 
 // ---- Камера + микрофон ----
-let localStream = null;
+navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+    .then(async stream => {
+        document.getElementById("localVideo").srcObject = stream;
 
-async function startLocalMedia() {
-    try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        document.getElementById("localVideo").srcObject = localStream;
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-        console.log("Local tracks added to RTCPeerConnection");
-    } catch (err) {
-        console.error("Media error:", err);
-        alert("Ошибка доступа к камере/микрофону: " + err.message);
-    }
-}
+        // создаём offer только после подключения WebSocket
+        const makeOffer = async () => {
+            if (!socketReady) {
+                setTimeout(makeOffer, 200);
+                return;
+            }
+            console.log("Sending offer");
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            wsSend({ type: "offer", offer });
+        };
 
-// Создаём offer (если инициатор)
-const makeOffer = async () => {
-    if (!socketReady) {
-        console.log("Socket not ready for offer, retry later");
-        return;
-    }
-    if (!localStream) {
-        console.log("No localStream for offer");
-        return;
-    }
-    console.log("makeOffer() called, isInitiator =", isInitiator);
-
-    try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        wsSend({ type: "offer", offer });
-        console.log("Offer sent");
-    } catch (e) {
-        console.error("Failed to create/send offer:", e);
-    }
-};
-
-// запускаем медиа сразу (чтобы локальные треки были готовы)
-startLocalMedia();
-
+        makeOffer();
+    })
+    .catch(err => console.error("Media error:", err));
 </script>
 </body>
 </html>

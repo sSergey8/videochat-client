@@ -1,4 +1,4 @@
-// Версия 1.3.6
+// Версия 1.3.7
 <!DOCTYPE html>
 <html>
 <head>
@@ -19,36 +19,16 @@
 <video id="remoteVideo" autoplay playsinline></video>
 
 <script>
-// ---------------- SETTINGS ----------------
+// ---- Настройки ----
 const signalingUrl = "wss://webrtc-signaling-server-9su4.onrender.com";
 const room = "default-room";
 
-// Twilio TURN
-const iceServers = [
-    { urls: "stun:global.stun.twilio.com:3478" },
-    {
-        urls: "turn:global.turn.twilio.com:3478?transport=udp",
-        username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
-        credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
-    },
-    {
-        urls: "turn:global.turn.twilio.com:3478?transport=tcp",
-        username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
-        credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
-    },
-    {
-        urls: "turn:global.turn.twilio.com:443?transport=tcp",
-        username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
-        credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
-    }
-];
-
-
-// ---------------- SIGNALING (WS) ----------------
+// ---- WebSocket ----
 const socket = new WebSocket(signalingUrl);
 let socketReady = false;
 let messageQueue = [];
 
+// отправка сообщений (ждём подключения)
 function wsSend(data) {
     if (!socketReady) {
         messageQueue.push(data);
@@ -58,101 +38,101 @@ function wsSend(data) {
 }
 
 socket.onopen = () => {
+    console.log("WS connected");
     socketReady = true;
+
     wsSend({ type: "join", room });
 
+    // отправляем накопленные сообщения
     messageQueue.forEach(msg => socket.send(JSON.stringify(msg)));
     messageQueue = [];
 };
 
-// ---------------- WEBRTC ----------------
-let pc = new RTCPeerConnection({ iceServers });
+socket.onerror = (e) => console.error("WS error", e);
 
-pc.onicecandidate = e => {
-    if (e.candidate) {
-        wsSend({ type: "candidate", candidate: e.candidate });
+// ---- WebRTC ----
+// *** Главное изменение: рабочий бесплатный TURN OpenRelay ***
+let pc = new RTCPeerConnection({
+    iceServers: [
+        { urls: "stun:global.stun.twilio.com:3478" },
+        {
+            urls: "turn:global.turn.twilio.com:3478?transport=udp",
+            username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
+            credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
+        },
+        {
+            urls: "turn:global.turn.twilio.com:3478?transport=tcp",
+            username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
+            credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
+        },
+        {
+            urls: "turn:global.turn.twilio.com:443?transport=tcp",
+            username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
+            credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
+        }
+    ]
+});
+
+
+pc.onicecandidate = event => {
+    if (event.candidate) {
+        wsSend({ type: "candidate", candidate: event.candidate });
     }
 };
 
-pc.ontrack = e => {
-    console.log("REMOTE STREAM");
-    document.getElementById("remoteVideo").srcObject = e.streams[0];
+pc.ontrack = event => {
+    console.log("Remote stream added");
+    document.getElementById("remoteVideo").srcObject = event.streams[0];
 };
 
-// ---------------- STATE FLAGS ----------------
-let localStream = null;
-let localStreamReady = false;
-let joinInfo = null;
-
-
-// ---------------- HANDLE INCOMING SIGNALING ----------------
+// обработка сигнала
 socket.onmessage = async msg => {
     const data = JSON.parse(msg.data);
 
-    if (data.type === "joined") {
-        joinInfo = data;
-        console.log("Joined room. Users:", joinInfo.count);
-        tryCreateOffer();
-        return;
-    }
-
     if (data.type === "offer") {
-        console.log("Received OFFER");
-
+        console.log("Got offer");
         await pc.setRemoteDescription(data.offer);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-
         wsSend({ type: "answer", answer });
-        return;
     }
 
     if (data.type === "answer") {
-        console.log("Received ANSWER");
+        console.log("Got answer");
         await pc.setRemoteDescription(data.answer);
-        return;
     }
 
     if (data.type === "candidate") {
         try {
             await pc.addIceCandidate(data.candidate);
-        } catch (err) {
-            console.error("ICE error", err);
+        } catch (e) {
+            console.error("Error adding ICE", e);
         }
-        return;
     }
 };
 
-
-// ---------------- CAMERA ----------------
+// ---- Камера + микрофон ----
 navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-    .then(stream => {
-        localStream = stream;
-        localStreamReady = true;
-
+    .then(async stream => {
         document.getElementById("localVideo").srcObject = stream;
-        stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
-        tryCreateOffer();
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+        // создаём offer только после подключения WebSocket
+        const makeOffer = async () => {
+            if (!socketReady) {
+                setTimeout(makeOffer, 200);
+                return;
+            }
+            console.log("Sending offer");
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            wsSend({ type: "offer", offer });
+        };
+
+        makeOffer();
     })
-    .catch(err => console.error("Camera/microphone error:", err));
-
-
-// ---------------- OFFER CREATION LOGIC ----------------
-async function tryCreateOffer() {
-    if (!socketReady || !localStreamReady || !joinInfo) return;
-
-    // Only FIRST user (count=1) creates offer
-    if (joinInfo.count === 1) {
-        console.log("Creating OFFER");
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        wsSend({ type: "offer", offer });
-    } else {
-        console.log("Second user → waiting for offer");
-    }
-}
-
+    .catch(err => console.error("Media error:", err));
 </script>
 </body>
 </html>

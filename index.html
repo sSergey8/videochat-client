@@ -1,4 +1,4 @@
-// Версия 1.4.0
+// Версия 1.4.1
 <!DOCTYPE html>
 <html>
 <head>
@@ -109,21 +109,24 @@ pc.oniceconnectionstatechange = () => {
 
 // обработка сигнала
 socket.onmessage = async msg => {
-    const data = JSON.parse(msg.data);
-    // логируем типы, чтобы легче было понять последовательность
-    console.log("WS message:", data.type, data);
+    console.log("<<< RAW WS:", msg.data);
+
+    let data;
+    try {
+        data = JSON.parse(msg.data);
+    } catch (e) {
+        console.error("JSON parse failed:", e);
+        return;
+    }
+
+    console.log("WS message:", data);
 
     if (data.type === "joined") {
-        // сервер возвращает count — используем это, чтобы решить кто будет создавать offer
         const count = data.count || 0;
         console.log("Joined room, count =", count);
 
-        // Если вы второй вошедший — создаём offer
-        // (т.е. сервер отвечает новому подключившемуся с count=2)
         if (count === 2) {
             isInitiator = true;
-            // создаём offer только после того как у нас уже добавлены локальные треки
-            // (мы будем пытаться создать offer; если ещё не добавили треки — makeOffer позаботится об этом)
             await makeOffer();
         }
         return;
@@ -137,11 +140,7 @@ socket.onmessage = async msg => {
             console.error("setRemoteDescription(offer) failed:", e);
             return;
         }
-        // Убедимся, что локальные треки уже добавлены перед созданием answer.
-        // Если вы ещё не захватили камеру/микрофон — это важно.
-        if (!localStream) {
-            console.warn("No local stream yet when got offer — wait until media ready");
-        }
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         wsSend({ type: "answer", answer });

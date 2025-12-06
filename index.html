@@ -1,19 +1,14 @@
-// Версия 1.4.5
+// Версия 1.4.6
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <title>P2P Video Chat</title>
 <style>
-    video {
-        width: 45%;
-        margin: 5px;
-        background: black;
-    }
+    video { width: 45%; margin: 5px; background: black; }
 </style>
 </head>
 <body>
-
 <h2>P2P Video Chat</h2>
 <video id="localVideo" autoplay muted playsinline></video>
 <video id="remoteVideo" autoplay playsinline></video>
@@ -24,115 +19,176 @@ const signalingUrl = "wss://intense-graph-less-refused.trycloudflare.com";
 const room = "default-room";
 
 // ---- WebSocket ----
-const socket = new WebSocket(signalingUrl);
+let socket = null;
 let socketReady = false;
 let messageQueue = [];
 
-// отправка сообщений (ждём подключения)
-function wsSend(data) {
-    if (!socketReady) {
-        messageQueue.push(data);
-        return;
-    }
-    socket.send(JSON.stringify(data));
+function connectWS() {
+    socket = new WebSocket(signalingUrl);
+
+    socket.onopen = () => {
+        console.log("WS connected");
+        socketReady = true;
+        flushQueue();
+        wsSend({ type: "join", room });
+    };
+
+    socket.onmessage = async msg => {
+        console.log("<<< RAW WS:", msg.data);
+        let data;
+        try { data = JSON.parse(msg.data); } catch (e) { console.error("Invalid WS JSON", e); return; }
+        handleSignal(data);
+    };
+
+    socket.onerror = e => console.error("WS error", e);
+    socket.onclose = () => { console.log("WS closed"); socketReady = false; };
 }
 
-socket.onopen = () => {
-    console.log("WS connected");
-    socketReady = true;
+function wsSend(obj) {
+    const json = JSON.stringify(obj);
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        messageQueue.push(json);
+        return;
+    }
+    socket.send(json);
+}
 
-    wsSend({ type: "join", room });
+function flushQueue() {
+    while (messageQueue.length > 0 && socket && socket.readyState === WebSocket.OPEN) {
+        const j = messageQueue.shift();
+        socket.send(j);
+    }
+}
 
-    // отправляем накопленные сообщения
-    messageQueue.forEach(msg => socket.send(JSON.stringify(msg)));
-    messageQueue = [];
-};
-
-socket.onerror = (e) => console.error("WS error", e);
+connectWS();
 
 // ---- WebRTC ----
-// *** Главное изменение: рабочий бесплатный TURN OpenRelay ***
-let pc = new RTCPeerConnection({
+const pc = new RTCPeerConnection({
     iceServers: [
         { urls: "stun:global.stun.twilio.com:3478" },
-        {
-            urls: "turn:global.turn.twilio.com:3478?transport=udp",
-            username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
-            credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
-        },
-        {
-            urls: "turn:global.turn.twilio.com:3478?transport=tcp",
-            username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
-            credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
-        },
-        {
-            urls: "turn:global.turn.twilio.com:443?transport=tcp",
-            username: "a545c6e4621b2ba9b810a161b377f49160772ee0ff06f390d4b2d297069767bb",
-            credential: "GshgV48ou2Qjoicwe/jM2TNGx16DvDH5zPBSi7/hZv8="
-        }
+        { urls: "turn:global.turn.twilio.com:3478?transport=udp", username: "a545c6...", credential: "GshgV..." },
+        { urls: "turn:global.turn.twilio.com:3478?transport=tcp", username: "a545c6...", credential: "GshgV..." },
+        { urls: "turn:global.turn.twilio.com:443?transport=tcp", username: "a545c6...", credential: "GshgV..." }
     ]
 });
 
-
 pc.onicecandidate = event => {
     if (event.candidate) {
+        console.log("Sending ICE candidate");
         wsSend({ type: "candidate", candidate: event.candidate });
     }
 };
 
 pc.ontrack = event => {
     console.log("Remote stream added");
-    document.getElementById("remoteVideo").srcObject = event.streams[0];
+    if (event.streams && event.streams[0]) {
+        document.getElementById("remoteVideo").srcObject = event.streams[0];
+    } else {
+        const ms = new MediaStream();
+        ms.addTrack(event.track);
+        document.getElementById("remoteVideo").srcObject = ms;
+    }
 };
 
-// обработка сигнала
-socket.onmessage = async msg => {
-    const data = JSON.parse(msg.data);
+pc.onconnectionstatechange = () => console.log("Connection state:", pc.connectionState);
+pc.oniceconnectionstatechange = () => console.log("ICE state:", pc.iceConnectionState);
+
+// сигналинг
+let localStream = null;
+let madeOffer = false;
+
+async function handleSignal(data) {
+    if (!data || !data.type) return;
+
+    if (data.type === "joined") {
+        console.log("Joined (you), count =", data.count);
+        // only the second joining client should create offer: count === 2
+        if (data.count === 2 && !madeOffer) {
+            if (!localStream) {
+                console.warn("No local stream yet; will try offer later");
+                return;
+            }
+            console.log("Creating offer (you are the joining peer)");
+            try {
+                madeOffer = true;
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                wsSend({ type: "offer", offer });
+                console.log("Offer sent");
+            } catch (e) {
+                console.error("Failed to create/send offer:", e);
+                madeOffer = false;
+            }
+        }
+        return;
+    }
+
+    if (data.type === "peer-joined") {
+        console.log("Peer joined notice, count=", data.count);
+        return;
+    }
 
     if (data.type === "offer") {
         console.log("Got offer");
-        await pc.setRemoteDescription(data.offer);
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        wsSend({ type: "answer", answer });
+        try {
+            await pc.setRemoteDescription(data.offer);
+            // ensure we have local tracks
+            if (!localStream) {
+                console.warn("No local stream when receiving offer");
+                return;
+            }
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            wsSend({ type: "answer", answer });
+            console.log("Answer sent");
+        } catch (e) {
+            console.error("Error handling offer:", e);
+        }
+        return;
     }
 
     if (data.type === "answer") {
         console.log("Got answer");
-        await pc.setRemoteDescription(data.answer);
+        try {
+            await pc.setRemoteDescription(data.answer);
+        } catch (e) {
+            console.error("Error applying answer:", e);
+        }
+        return;
     }
 
     if (data.type === "candidate") {
         try {
             await pc.addIceCandidate(data.candidate);
+            console.log("Added remote ICE candidate");
         } catch (e) {
-            console.error("Error adding ICE", e);
+            console.error("Error adding ICE candidate:", e);
         }
+        return;
     }
-};
+}
 
-// ---- Камера + микрофон ----
-navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-    .then(async stream => {
-        document.getElementById("localVideo").srcObject = stream;
+// ---- local media ----
+async function startLocalMedia() {
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        document.getElementById("localVideo").srcObject = localStream;
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        console.log("Local tracks added to RTCPeerConnection");
+    } catch (err) {
+        console.error("Media error:", err);
+        alert("Ошибка доступа к камере/микрофону: " + err.message);
+    }
+}
 
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+startLocalMedia();
 
-        // создаём offer только после подключения WebSocket
-        const makeOffer = async () => {
-            if (!socketReady) {
-                setTimeout(makeOffer, 200);
-                return;
-            }
-            console.log("Sending offer");
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            wsSend({ type: "offer", offer });
-        };
+// send bye on unload
+window.addEventListener("beforeunload", () => {
+    try { wsSend({ type: "bye" }); } catch (e) {}
+    if (socket) socket.close();
+});
 
-        makeOffer();
-    })
-    .catch(err => console.error("Media error:", err));
 </script>
 </body>
 </html>
